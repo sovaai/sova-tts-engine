@@ -35,16 +35,15 @@ alignments_path:
 training_files:
 validation_files:
 
-language: "ru_trans" # possible entries: en, ru, ru_trans
-dict_path:
-text_cleaners:
-# stress: Union[float, bool]. If float, the number must be in {0, 1} - the probability of including stressed
-# words into learning process
-stress: False
-# phonemes: Union[float, bool]. If float, the number must be in {0, 1} - the probability of including phoneme
-# representation of words into learning process
-phonemes: False
-dict_prime: True
+charset: "ru_trans" # possible entries: en, ru, ru_trans
+text_handler_cfg: # data/text_handler_cfg.yaml
+
+# mask_stress: Union[float, bool]. If float, the number must be in {0, 1} - the probability of masking stressed
+# words into learning process (passing them unstressed)
+mask_stress: False
+# mask_phonemes: Union[float, bool]. If float, the number must be in {0, 1} - the probability of masking phoneme
+# representation of words into learning process (passing them in grapheme representation)
+mask_phonemes: True
 word_level_prob: True
 
 shuffle: true
@@ -138,9 +137,16 @@ optim_options:
 # examples: Ranger = RAdam + LookAhead
 with_lookahead: False
 
-use_saved_learning_rate: False
-lr_decay: 1.0
-lr_decay_milestones: []
+lr_scheduler: "multi_step" # possible entries: 'none', 'multi_step', 'exp', 'plateau', 'cyclic'
+lr_scheduler_options:
+#  max_lr: !!float 1e-3
+#  base_lr: !!float 1e-5
+#  mode: "exp_range"
+#  gamma: 0.9
+#  cycle_momentum: false
+  gamma: 0.1
+  milestones: [100, 110]
+restore_scheduler_state: False
 
 grad_clip_thresh: 1.0
 batch_size: 4

@@ -99,7 +99,6 @@ class DistributedDataParallel(Module):
                 continue
             dist.broadcast(p, 0)
 
-
         def allreduce_params():
             if (self.needs_reduction):
                 self.needs_reduction = False
@@ -126,15 +125,12 @@ class DistributedDataParallel(Module):
                     for buf, synced in zip(grads, _unflatten_dense_tensors(coalesced, grads)):
                         buf.copy_(synced)
 
-
         for param in list(self.module.parameters()):
             def allreduce_hook(*unused):
                 param._execution_engine.queue_callback(allreduce_params)
 
-
             if param.requires_grad:
                 param.register_hook(allreduce_hook)
-
 
     def forward(self, *inputs, **kwargs):
         self.needs_reduction = True
@@ -178,7 +174,6 @@ def apply_gradient_allreduce(module):
             continue
         dist.broadcast(p, 0)
 
-
     def allreduce_params():
         if (module.needs_reduction):
             module.needs_reduction = False
@@ -205,19 +200,15 @@ def apply_gradient_allreduce(module):
                 for buf, synced in zip(grads, _unflatten_dense_tensors(coalesced, grads)):
                     buf.copy_(synced)
 
-
     for param in list(module.parameters()):
         def allreduce_hook(*unused):
             Variable._execution_engine.queue_callback(allreduce_params)
 
-
         if param.requires_grad:
             param.register_hook(allreduce_hook)
 
-
     def set_needs_reduction(self, input, output):
         self.needs_reduction = True
-
 
     module.register_forward_hook(set_needs_reduction)
     return module

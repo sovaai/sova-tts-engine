@@ -2,6 +2,7 @@
 Based on https://github.com/KinglittleQ/GST-Tacotron/blob/master/GST.py
 """
 import torch
+import torch.nn as nn
 
 from modules.layers import LinearNorm, ConvBlock
 from utils.utils import OutputsGST
@@ -22,13 +23,16 @@ class ReferenceEncoder(torch.nn.Module):
             for in_channels, out_channels in channels]
         )
 
-        out_channels = self.calculate_channels(
-            length=hparams.n_mel_channels,
-            kernel_size=hparams.reference_encoder_kernel[0],
-            stride=hparams.reference_encoder_strides[0],
-            pad=hparams.reference_encoder_pad[0],
-            n_convs=len(hparams.reference_encoder_filters)
-        )
+        self.conv_params = {
+            "kernel_size": hparams.reference_encoder_kernel[0],
+            "stride": hparams.reference_encoder_strides[0],
+            "pad": hparams.reference_encoder_pad[0],
+            "n_convs": len(hparams.reference_encoder_filters)
+        }
+
+        self.n_mels = hparams.n_mel_channels
+
+        out_channels = self.calculate_size(dim_size=self.n_mels, **self.conv_params)
 
         self.gru = torch.nn.GRU(
             input_size=hparams.reference_encoder_filters[-1] * out_channels,
@@ -36,19 +40,22 @@ class ReferenceEncoder(torch.nn.Module):
             batch_first=True
         )
 
-        self.n_mels = hparams.n_mel_channels
 
-
-    def forward(self, inputs):
+    def forward(self, inputs, input_lengths=None):
         N = inputs.size(0)
         out = inputs.view(N, 1, -1, self.n_mels)  # [N, 1, Ty, n_mels]
         for conv in self.convs:
             out = conv(out)
 
         out = out.transpose(1, 2)  # [N, Ty//2^K, 128, n_mels//2^K]
-        T = out.size(1)
-        N = out.size(0)
+        N, T = out.size(0), out.size(1)
         out = out.contiguous().view(N, T, -1)  # [N, Ty//2^K, 128*n_mels//2^K]
+
+        if input_lengths is not None:
+            _input_lengths = self.calculate_size(input_lengths, **self.conv_params)
+            out = nn.utils.rnn.pack_padded_sequence(
+                out, _input_lengths, batch_first=True, enforce_sorted=False
+            )
 
         self.gru.flatten_parameters()
         _, out = self.gru(out)  # out --- [1, N, E//2]
@@ -56,10 +63,11 @@ class ReferenceEncoder(torch.nn.Module):
         return out.squeeze(0)
 
 
-    def calculate_channels(self, length, kernel_size, stride, pad, n_convs):
+    @staticmethod
+    def calculate_size(dim_size, kernel_size, stride, pad, n_convs):
         for _ in range(n_convs):
-            length = (length - kernel_size + 2 * pad) // stride + 1
-        return length
+            dim_size = (dim_size - kernel_size + 2 * pad) // stride + 1
+        return dim_size
 
 
 class STL(torch.nn.Module):
@@ -151,8 +159,8 @@ class GST(torch.nn.Module):
         self.device = torch.device("cpu" if not torch.cuda.is_available() else hparams.device)
 
 
-    def forward(self, inputs, **kwargs):
-        weights, style_emb = self.stl(self.encoder(inputs))
+    def forward(self, inputs, input_lengths=None):
+        weights, style_emb = self.stl(self.encoder(inputs, input_lengths=input_lengths))
 
         outputs = OutputsGST(
             style_emb=style_emb,

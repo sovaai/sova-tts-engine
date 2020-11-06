@@ -29,13 +29,14 @@ CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
 OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 """
+import warnings
+from collections import OrderedDict
 from enum import Enum
 
-import numpy as np
 import torch
 from torch import nn
 
-from utils.utils import to_gpu
+from utils.utils import get_mask_from_lengths
 
 
 class AttentionTypes(str, Enum):
@@ -61,16 +62,35 @@ mel_loss_func = {
 
 
 def diagonal_guide(text_len, mel_len, g=0.2):
-    gridN = np.tile(np.arange(text_len).reshape((1, -1)), (mel_len, 1))
-    gridT = np.tile(np.arange(mel_len).reshape((-1, 1)), (1, text_len))
+    grid_text = torch.linspace(0., 1. - 1. / text_len, text_len)  # (T)
+    grid_mel = torch.linspace(0., 1. - 1. / mel_len, mel_len)  # (M)
+    grid = grid_text.view(1, -1) - grid_mel.view(-1, 1)  # (M, T)
 
-    W = 1 - np.exp(-(gridN / text_len - gridT / mel_len) ** 2 / (2 * g ** 2))
+    W = 1 - torch.exp(-grid ** 2 / (2 * g ** 2))
+    return W
 
-    return torch.Tensor(W)
+
+def batch_diagonal_guide(text_lengths, mel_lengths, g=0.2):
+    dtype, device = torch.float32, text_lengths.device
+
+    grid_text = torch.arange(text_lengths.max(), dtype=dtype, device=device)
+    grid_text = grid_text.view(1, -1) / text_lengths.view(-1, 1)  # (B, T)
+
+    grid_mel = torch.arange(mel_lengths.max(), dtype=dtype, device=device)
+    grid_mel = grid_mel.view(1, -1) / mel_lengths.view(-1, 1)  # (B, M)
+
+    grid = grid_text.unsqueeze(1) - grid_mel.unsqueeze(2)  # (B, M, T)
+
+    # apply text and mel length masks
+    grid.transpose(2, 1)[~get_mask_from_lengths(text_lengths)] = 0.
+    grid[~get_mask_from_lengths(mel_lengths)] = 0.
+
+    W = 1 - torch.exp(-grid ** 2 / (2 * g ** 2))
+    return W
 
 
 def diagonal_loss(predicted, text_len, mel_len, g=0.2):
-    guide = to_gpu(torch.Tensor(np.zeros(predicted.shape, dtype=np.float32)))
+    guide = predicted.new_zeros(predicted.shape)
     guide[:mel_len, :text_len] = diagonal_guide(text_len, mel_len, g)
     return predicted * guide
 
@@ -82,46 +102,38 @@ def prealigned_loss(target, predicted):
 
 class Tacotron2Loss(nn.Module):
     def __init__(self, hparams):
-        self.guided_attention_type = AttentionTypes(hparams.guided_attention_type)
-        self.diagonal_factor = None
-        if self.guided_attention_type == AttentionTypes.diagonal:
-            self.diagonal_factor = hparams.diagonal_factor
-        self.attention_weight = hparams.attention_weight
-
-        self.include_padding = hparams.include_padding
-        self.mel_loss_type = LossesType(hparams.mel_loss_type)
-
-        self.gate_positive_weight = torch.tensor(hparams.gate_positive_weight)
-
         super().__init__()
 
+        self.mel_loss_type = LossesType(hparams.mel_loss_type)
+        self.mel_criterion = mel_loss_func[self.mel_loss_type]()
 
-    def forward(self, model_output, targets):
-        mels_target = targets.mels
+        self.gate_positive_weight = torch.tensor(hparams.gate_positive_weight)
+        self.gate_criterion = nn.BCEWithLogitsLoss(pos_weight=self.gate_positive_weight)
+
+
+    def forward(self, mels_out, mels_postnet_out, gate_out, mels_target, gate_target):
+        # ошибка мелов
         mels_target.requires_grad = False
 
-        mels = model_output.mels
-        mels_postnet = model_output.mels_postnet
+        mel_loss = self.mel_criterion(mels_out, mels_target) + \
+                   self.mel_criterion(mels_postnet_out, mels_target)
 
-        mel_loss = mel_loss_func[self.mel_loss_type]()(mels, mels_target) + \
-                   mel_loss_func[self.mel_loss_type]()(mels_postnet, mels_target)
-
-        gate_target = targets.gate
+        # ошибка сигнала окончания предложения
         gate_target.requires_grad = False
         gate_target = gate_target.view(-1, 1)
 
-        gate_out = model_output.gate.view(-1, 1)
+        gate_out = gate_out.view(-1, 1)
 
-        gate_loss = nn.BCEWithLogitsLoss(pos_weight=self.gate_positive_weight)(gate_out, gate_target)
+        gate_loss = self.gate_criterion(gate_out, gate_target)
 
         return mel_loss, gate_loss
 
 
 class AttentionLoss(nn.Module):
     def __init__(self, hparams):
-        self.guided_attention_type = AttentionTypes(hparams.guided_attention_type)
+        self.type = AttentionTypes(hparams.guided_attention_type)
         self.diagonal_factor = None
-        if self.guided_attention_type == AttentionTypes.diagonal:
+        if self.type == AttentionTypes.diagonal:
             self.diagonal_factor = hparams.diagonal_factor
         self.attention_weight = hparams.attention_weight
 
@@ -130,47 +142,96 @@ class AttentionLoss(nn.Module):
         super().__init__()
 
 
-    def forward(self, targets, predictions, text_lengths, mel_lengths):
-        batchsize = len(text_lengths)
-
+    def forward(self, attn_out, attn_target, text_lengths, mel_lengths):
+        batch_size = len(text_lengths)
         attention_loss = 0
 
-        if self.guided_attention_type == AttentionTypes.none:
+        if self.type == AttentionTypes.none:
             return
         else:
-            text_lengths = text_lengths.cpu().numpy() if isinstance(text_lengths, torch.Tensor) else text_lengths
-            mel_lengths = mel_lengths.cpu().numpy() if isinstance(mel_lengths, torch.Tensor) else mel_lengths
+            if self.type == AttentionTypes.diagonal:
+                diagonal_guides = batch_diagonal_guide(
+                    text_lengths=text_lengths,
+                    mel_lengths=mel_lengths,
+                    g=self.diagonal_factor
+                )
+                attention_loss = torch.sum(attn_out * diagonal_guides)
 
-            lengths = list(zip(text_lengths, mel_lengths))
+            elif self.type == AttentionTypes.prealigned:
+                for i in range(batch_size):
+                    if attn_target[i].max() == 0.:
+                        attn_target[i] = attn_out[i]  # если матрица выравнивания недоступна - ошибка=0
 
-            if self.guided_attention_type == AttentionTypes.diagonal:
-                for i, text_mel in enumerate(lengths):
-                    text_length, mel_length = text_mel
-
-                    attention_loss += torch.sum(
-                        diagonal_loss(
-                            predicted=predictions[i],
-                            text_len=text_length,
-                            mel_len=mel_length,
-                            g=self.diagonal_factor
-                        )
-                    )
-
-            elif self.guided_attention_type == AttentionTypes.prealigned:
-                for i in range(batchsize):
-                    if targets[i].max == 0:
-                        targets[i] = predictions[i]  # если матрица выравнивания недоступна - ошибка=0
-
-                attention_loss += nn.MSELoss(reduction="sum")(predictions, targets)
+                attention_loss += nn.MSELoss(reduction="sum")(attn_out, attn_target)
 
             else:
                 raise TypeError
 
             if not self.include_padding:
-                active_elements = sum([text_len * mel_len for text_len, mel_len in lengths])
+                active_elements = torch.sum(text_lengths * mel_lengths)
             else:
-                active_elements = batchsize * max(text_lengths) * max(mel_lengths)
+                active_elements = batch_size * text_lengths.max() * mel_lengths.max()
 
             attention_loss = attention_loss / active_elements * self.attention_weight
 
             return attention_loss
+
+
+class OverallLoss(nn.Module):
+    def __init__(self, hparams):
+        super().__init__()
+
+        self.basic_criterion = Tacotron2Loss(hparams)
+        self.list = ["overall/loss", "decoder/mel_loss", "decoder/gate_loss"]
+
+        self.attention_criterion = None
+        if hparams.guided_attention_type in AttentionTypes.guided_types():
+            if hparams.guided_attention_type == AttentionTypes.prealigned:
+                assert not hparams.word_level_prob
+            self.attention_criterion = AttentionLoss(hparams)
+            self.list.append("decoder/attention_loss")
+
+        self.mmi_criterion = None
+        if hparams.use_mmi:
+            from modules.mmi import MIEsitmator # импортим тут, чтобы избежать циклических импортов
+            self.mmi_criterion = MIEsitmator(hparams)
+            self.list.append("mi/loss")
+
+
+    def forward(self, outputs, inputs, **kwargs):
+        losses = OrderedDict({loss: 0 for loss in self.list})
+
+        mel_loss, gate_loss = self.basic_criterion(
+            outputs.mels, outputs.mels_postnet, outputs.gate,
+            inputs.mels, inputs.gate
+        )
+        losses["decoder/mel_loss"] = mel_loss
+        losses["decoder/gate_loss"] = gate_loss
+        losses["overall/loss"] += (mel_loss + gate_loss)
+
+        if self.attention_criterion is not None:
+            alignments = kwargs.get("alignments", None)
+            if alignments is None and self.attention_criterion.type == AttentionTypes.prealigned:
+                warnings.warn("Insufficient number of arguments to calculate the attention loss")
+            else:
+                attention_loss = self.attention_criterion(
+                    outputs.alignments, alignments,
+                    inputs.text_len, inputs.mel_len
+                )
+                losses["decoder/attention_loss"] = attention_loss
+                losses["overall/loss"] += attention_loss
+
+        if self.mmi_criterion is not None:
+            inputs_ctc = kwargs.get("inputs_ctc", None)
+            decoder_outputs = kwargs.get("decoder_outputs", None)
+            if inputs_ctc is None or decoder_outputs is None:
+                warnings.warn("Insufficient number of arguments to calculate the mi loss")
+            else:
+                mi_loss = self.mmi_criterion(
+                    decoder_outputs, inputs_ctc.text,
+                    inputs.mel_len, inputs_ctc.length
+                )
+                losses["mi/loss"] = mi_loss
+                losses["overall/loss"] += mi_loss
+
+        return losses

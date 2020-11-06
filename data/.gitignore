@@ -1,4 +1,5 @@
 *
 
 !hparams.yaml
+!text_handler_cfg.yaml
 !.gitignore

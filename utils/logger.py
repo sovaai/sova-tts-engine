@@ -44,15 +44,17 @@ class Tacotron2Logger(SummaryWriter):
 
     def log_training(self, losses_dict, grad_norm, learning_rate, duration, iteration):
         for key, value in losses_dict.items():
+            key = "overall/train_loss" if key == "overall/loss" else key
             self.add_scalar(key, value, iteration)
 
-        self.add_scalar("grad.norm", grad_norm, iteration)
-        self.add_scalar("learning.rate", learning_rate, iteration)
-        self.add_scalar("duration", duration, iteration)
+        self.add_scalar("training/grad_norm", grad_norm, iteration)
+        self.add_scalar("training/learning_rate", learning_rate, iteration)
+        self.add_scalar("training/duration", duration, iteration)
 
 
     def log_validation(self, losses_dict, model, target, prediction, iteration, target_alignments=None):
         for key, value in losses_dict.items():
+            key = "overall/val_loss" if key == "overall/loss" else key
             self.add_scalar(key, value, iteration)
 
         # plot distribution of parameters
@@ -67,20 +69,20 @@ class Tacotron2Logger(SummaryWriter):
             target_alignment = target_alignments[idx].data.cpu().numpy().T
 
             self.add_image(
-                "alignment_target",
+                "alignment/target",
                 plot_alignment_to_numpy(target_alignment),
                 iteration, dataformats='HWC')
 
         self.add_image(
-            "alignment_predicted",
+            "alignment/predicted",
             plot_alignment_to_numpy(prediction.alignments[idx].data.cpu().numpy().T),
             iteration, dataformats='HWC')
         self.add_image(
-            "mel_target",
+            "mel/target",
             plot_spectrogram_to_numpy(target.mels[idx].data.cpu().numpy()),
             iteration, dataformats='HWC')
         self.add_image(
-            "mel_predicted",
+            "mel/predicted",
             plot_spectrogram_to_numpy(prediction.mels[idx].data.cpu().numpy()),
             iteration, dataformats='HWC')
         self.add_image(

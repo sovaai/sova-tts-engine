@@ -30,9 +30,19 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 """
 import yaml
+import json
 
 
 class AttributeDict(dict):
+    def __init__(self, dct=None):
+        super().__init__()
+        dct = dict() if not dct else dct
+        for key, value in dct.items():
+            if hasattr(value, 'keys'):
+                value = AttributeDict(value)
+            self[key] = value
+
+
     def __getattr__(self, attr):
         return self[attr]
 
@@ -41,8 +51,23 @@ class AttributeDict(dict):
         self[attr] = value
 
 
-def create_hparams(config_path):
-    with open(config_path, "r", encoding="utf-8") as stream:
-        config = yaml.safe_load(stream)
+    def __getstate__(self):
+        return self
 
-    return AttributeDict(**config)
+
+    def __setstate__(self, state):
+        pass
+
+
+    def dumps(self):
+        return json.dumps(self)
+
+
+def create_hparams(config_source):
+    if isinstance(config_source, dict):
+        config = config_source
+    elif isinstance(config_source, str):
+        with open(config_source, "r", encoding="utf-8") as stream:
+            config = yaml.safe_load(stream)
+
+    return AttributeDict(config)

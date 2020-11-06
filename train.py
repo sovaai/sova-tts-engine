@@ -30,9 +30,12 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 """
 import os
+import re
 import time
 import math
 import argparse
+from shutil import copyfile
+
 import numpy as np
 from collections import OrderedDict
 
@@ -41,12 +44,13 @@ import torch.distributed as dist
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data import DataLoader
 
+from tps import Handler
+
 from model import load_model
 from utils.data_utils import TextMelLoader, TextMelCollate, CustomSampler
 from utils.distributed import apply_gradient_allreduce
-from modules.optimizers import build_optimizer
-from modules.loss_function import Tacotron2Loss, AttentionLoss, AttentionTypes
-from modules.mmi import MIEsitmator
+from modules.optimizers import build_optimizer, build_scheduler, SchedulerTypes
+from modules.loss_function import OverallLoss
 from hparams import create_hparams
 from utils import gradient_adaptive_factor
 
@@ -84,8 +88,13 @@ def init_distributed(hparams, n_gpus, rank, group_name):
 
 def prepare_dataloaders(hparams, distributed_run=False):
     # Get data, data loaders and collate function ready
-    trainset = TextMelLoader(hparams.training_files, hparams)
-    valset = TextMelLoader(hparams.validation_files, hparams)
+    assert isinstance(hparams.text_handler_cfg, str)
+    text_handler = Handler.from_config(hparams.text_handler_cfg)
+    text_handler.out_max_length = None
+    assert text_handler.charset.value == hparams.charset
+
+    trainset = TextMelLoader(text_handler, hparams.training_files, hparams)
+    valset = TextMelLoader(text_handler, hparams.validation_files, hparams)
     collate_fn = TextMelCollate(hparams.n_frames_per_step)
 
     if distributed_run:
@@ -119,7 +128,7 @@ def warm_start_model(checkpoint_path, model, ignore_layers):
     model_dict = checkpoint_dict["state_dict"]
     if len(ignore_layers) > 0:
         model_dict = {k: v for k, v in model_dict.items()
-                      if k not in ignore_layers}
+                      if not any(re.search(layer, k) for layer in ignore_layers)}
         dummy_dict = model.state_dict()
         dummy_dict.update(model_dict)
         model_dict = dummy_dict
@@ -127,15 +136,15 @@ def warm_start_model(checkpoint_path, model, ignore_layers):
     return model
 
 
-def load_checkpoint(checkpoint_path, model, optimizer, lr_scheduler, mi_estimator=None, restore_lr=True):
+def load_checkpoint(checkpoint_path, model, optimizer, lr_scheduler, criterion, restore_lr=True):
     assert os.path.isfile(checkpoint_path)
     print("Loading checkpoint '{}'".format(checkpoint_path))
 
     checkpoint_dict = torch.load(checkpoint_path, map_location="cpu")
     model.load_state_dict(checkpoint_dict["state_dict"])
     optimizer.load_state_dict(checkpoint_dict["optimizer"])
-    if mi_estimator is not None:
-        mi_estimator.load_state_dict(checkpoint_dict["mi_estimator"])
+    if criterion.mmi_criterion is not None:
+        criterion.mmi_criterion.load_state_dict(checkpoint_dict["mi_estimator"])
 
     iteration = checkpoint_dict["iteration"]
 
@@ -144,20 +153,17 @@ def load_checkpoint(checkpoint_path, model, optimizer, lr_scheduler, mi_estimato
         for lr, param_group in zip(base_lr, optimizer.param_groups):
             param_group["lr"] = lr
     else:
-        gamma = lr_scheduler.gamma
         lr_scheduler_params = checkpoint_dict.get("lr_scheduler", None)
         if lr_scheduler_params is not None:
             lr_scheduler.load_state_dict(lr_scheduler_params)
 
-        lr_scheduler.gamma = gamma
-
-    print("Loaded checkpoint '{}' from iteration {}".format(
+    print("Loaded checkpoint '{}' from iteration {}" .format(
         checkpoint_path, iteration))
 
-    return model, optimizer, lr_scheduler, mi_estimator, iteration
+    return model, optimizer, lr_scheduler, criterion, iteration
 
 
-def save_checkpoint(model, optimizer, lr_scheduler, mi_estimator, iteration, filepath):
+def save_checkpoint(model, optimizer, lr_scheduler, criterion, iteration, hparams, filepath):
     print("Saving model and optimizer state at iteration {} to {}".format(
         iteration, filepath))
 
@@ -165,25 +171,21 @@ def save_checkpoint(model, optimizer, lr_scheduler, mi_estimator, iteration, fil
         "iteration": iteration,
         "state_dict": model.state_dict(),
         "optimizer": optimizer.state_dict(),
-        "lr_scheduler": lr_scheduler.state_dict()
+        "lr_scheduler": lr_scheduler.state_dict(),
+        "hparams": hparams.dumps()
     }
 
-    if mi_estimator is not None:
-        train_dict["mi_estimator"] = mi_estimator.state_dict()
+    if criterion.mmi_criterion is not None:
+        train_dict["mi_estimator"] = criterion.mmi_criterion.state_dict()
 
     torch.save(train_dict, filepath)
 
 
-def validate(model, criterion, valset, iteration, batch_size, collate_fn, logger, distributed_run, rank, n_gpus,
-             losses_dict, **additional_criterions):
+def validate(model, criterion, valset, iteration, batch_size, collate_fn, logger, distributed_run, rank, n_gpus):
     """Handles all the validation scoring and printing"""
     shuffle = not distributed_run
 
-    ordered_keys = ["val_loss"] + list(losses_dict.keys())[1:]
-    losses_dict = OrderedDict({key: [] for key in ordered_keys})
-
-    attention_criterion = additional_criterions.get("attention_criterion")
-    mmi_criterion = additional_criterions.get("mmi_criterion")
+    losses_dict = OrderedDict({key: [] for key in criterion.list})
 
     model.eval()
     with torch.no_grad():
@@ -197,22 +199,15 @@ def validate(model, criterion, valset, iteration, batch_size, collate_fn, logger
 
             outputs, decoder_outputs = model(inputs)
 
-            mel_loss, gate_loss = criterion(outputs, inputs)
-            losses_dict["mel_loss"].append(mel_loss)
-            losses_dict["gate_loss"].append(gate_loss)
-            loss = mel_loss + gate_loss
+            losses = criterion(
+                outputs, inputs,
+                alignments=alignments,
+                inputs_ctc=inputs_ctc,
+                decoder_outputs=decoder_outputs
+            )
 
-            if attention_criterion is not None:
-                attention_loss = attention_criterion(alignments, outputs.alignments, inputs.text_len, inputs.mel_len)
-                losses_dict["attention_loss"].append(attention_loss)
-                loss += attention_loss
-
-            if mmi_criterion is not None:
-                mi_loss = mmi_criterion(decoder_outputs, inputs_ctc.text, inputs.mel_len, inputs_ctc.length)
-                losses_dict["mi_loss"].append(mi_loss)
-                loss += mi_loss
-
-            losses_dict["val_loss"].append(loss)
+            for loss_name, loss_value in losses.items():
+                losses_dict[loss_name].append(loss_value)
 
         reduced_losses_dict = {key: [reduce_loss(l, distributed_run, n_gpus) for l in value]
                                for key, value in losses_dict.items()}
@@ -220,9 +215,11 @@ def validate(model, criterion, valset, iteration, batch_size, collate_fn, logger
 
     model.train()
     if rank == 0:
-        print("Validation loss {}: {:9f}  ".format(iteration, reduced_losses_dict["val_loss"]))
+        print("Validation loss {}: {:9f}  ".format(iteration, reduced_losses_dict["overall/loss"]))
         print()
         logger.log_validation(reduced_losses_dict, model, inputs, outputs, iteration, alignments)
+
+    return reduced_losses_dict["overall/loss"]
 
 
 def train(hparams, distributed_run=False, rank=0, n_gpus=None):
@@ -231,18 +228,13 @@ def train(hparams, distributed_run=False, rank=0, n_gpus=None):
     if distributed_run:
         assert n_gpus is not None
 
-    if hparams.guided_attention_type == AttentionTypes.prealigned:
-        assert not hparams.word_level_prob
-
     torch.manual_seed(hparams.seed)
     torch.cuda.manual_seed(hparams.seed)
 
     model = load_model(hparams, distributed_run)
     optimizer = build_optimizer(model, hparams)
-
-    # lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer=optimizer, gamma=hparams.lr_decay)
-    lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer=optimizer, milestones=hparams.lr_decay_milestones,
-                                                        gamma=hparams.lr_decay)
+    lr_scheduler = build_scheduler(optimizer, hparams)
+    criterion = OverallLoss(hparams)
 
     if hparams.fp16_run:
         from apex import amp
@@ -252,26 +244,8 @@ def train(hparams, distributed_run=False, rank=0, n_gpus=None):
     if distributed_run:
         model = apply_gradient_allreduce(model)
 
-    criterion = Tacotron2Loss(hparams)
-    losses = OrderedDict({
-        "overall_loss": 0,
-        "mel_loss": 0,
-        "gate_loss": 0
-    })
-
-    attention_criterion = None
-    if hparams.guided_attention_type in AttentionTypes.guided_types():
-        attention_criterion = AttentionLoss(hparams)
-
-        losses["attention_loss"] = 0
-
-    mmi_criterion = None
-    if hparams.use_mmi:
-        mmi_criterion = MIEsitmator(hparams)
-
-        losses["mi_loss"] = 0
-
     logger = prepare_directories_and_logger(hparams.output_dir, hparams.log_dir, rank)
+    copyfile(hparams.path, os.path.join(hparams.output_dir, 'hparams.yaml'))
     train_loader, valset, collate_fn = prepare_dataloaders(hparams, distributed_run)
 
     # Load checkpoint if one exists
@@ -283,7 +257,7 @@ def train(hparams, distributed_run=False, rank=0, n_gpus=None):
                 hparams.checkpoint, model, hparams.ignore_layers)
         else:
             model, optimizer, lr_scheduler, mmi_criterion, iteration = load_checkpoint(
-                hparams.checkpoint, model, optimizer, lr_scheduler, mmi_criterion, hparams.use_saved_learning_rate
+                hparams.checkpoint, model, optimizer, lr_scheduler, criterion, hparams.restore_scheduler_state
             )
 
             iteration += 1  # next iteration is iteration + 1
@@ -295,6 +269,8 @@ def train(hparams, distributed_run=False, rank=0, n_gpus=None):
     for epoch in range(epoch_offset, hparams.epochs):
         print("Epoch: {}".format(epoch))
         for i, batch in enumerate(train_loader):
+            torch.cuda.empty_cache()
+
             start = time.perf_counter()
 
             model.zero_grad()
@@ -302,32 +278,24 @@ def train(hparams, distributed_run=False, rank=0, n_gpus=None):
 
             outputs, decoder_outputs = model(inputs)
 
-            mel_loss, gate_loss = criterion(outputs, inputs)
+            losses = criterion(
+                outputs, inputs,
+                alignments=alignments,
+                inputs_ctc=inputs_ctc,
+                decoder_outputs=decoder_outputs
+            )
 
-            losses["mel_loss"] = mel_loss
-            losses["gate_loss"] = gate_loss
-            loss = mel_loss + gate_loss
+            if hparams.use_mmi and hparams.use_gaf and i % gradient_adaptive_factor.UPDATE_GAF_EVERY_N_STEP == 0:
+                mi_loss = losses["mi/loss"]
+                overall_loss = losses["overall/loss"]
 
-            if attention_criterion is not None:
-                attention_loss = attention_criterion(alignments, outputs.alignments, inputs.text_len, inputs.mel_len)
-                losses["attention_loss"] = attention_loss
-                loss += attention_loss
+                gaf = calc_gaf(model, optimizer, overall_loss, mi_loss, hparams.max_gaf)
 
-            if mmi_criterion is not None:
-                mi_loss = mmi_criterion(decoder_outputs, inputs_ctc.text, inputs.mel_len, inputs_ctc.length)
-
-                if hparams.use_gaf and i % gradient_adaptive_factor.UPDATE_GAF_EVERY_N_STEP == 0:
-                    gaf = calc_gaf(model, optimizer, loss, mi_loss, hparams.max_gaf)
-                else:
-                    gaf = 1.0
-
-                mi_loss *= gaf
-                losses["mi_loss"] = mi_loss
-                loss += mi_loss
-
-            losses["overall_loss"] = loss
+                losses["mi/loss"] = gaf * mi_loss
+                losses["overall/loss"] = overall_loss - mi_loss * (1 - gaf)
 
             reduced_losses = {key: reduce_loss(value, distributed_run, n_gpus) for key, value in losses.items()}
+            loss = losses["overall/loss"]
 
             if hparams.fp16_run:
                 with amp.scale_loss(loss, optimizer) as scaled_loss:
@@ -343,28 +311,30 @@ def train(hparams, distributed_run=False, rank=0, n_gpus=None):
             optimizer.step()
 
             if not is_overflow and rank == 0:
-                duration = time.perf_counter() - start
-                print("Iteration {}: overall loss {:.6f} Grad Norm {:.6f} {:.2f}s/it".format(
-                    iteration, reduced_losses["overall_loss"], grad_norm, duration))
-
                 learning_rate = lr_scheduler.get_last_lr()[0]
+                duration = time.perf_counter() - start
+                print("Iteration {}: overall loss {:.6f} Grad Norm {:.6f} {:.2f}s/it LR {:.3E}".format(
+                    iteration, reduced_losses["overall/loss"], grad_norm, duration, learning_rate))
 
                 logger.log_training(reduced_losses, grad_norm, learning_rate, duration, iteration)
 
             if not is_overflow and (iteration % hparams.iters_per_checkpoint == 0):
-                validate(model, criterion, valset, iteration, hparams.batch_size, collate_fn, logger,
-                         distributed_run, rank, n_gpus, losses,
-                         attention_criterion=attention_criterion,
-                         mmi_criterion=mmi_criterion)
+                val_loss = validate(model, criterion, valset, iteration, hparams.batch_size, collate_fn, logger,
+                                    distributed_run, rank, n_gpus)
                 if rank == 0:
                     checkpoint = os.path.join(
                         hparams.output_dir, "checkpoint_{}".format(iteration))
 
-                    save_checkpoint(model, optimizer, lr_scheduler, mmi_criterion, iteration, checkpoint)
+                    save_checkpoint(model, optimizer, lr_scheduler, criterion, iteration, hparams, checkpoint)
 
             iteration += 1
+            if hparams.lr_scheduler == SchedulerTypes.cyclic:
+                lr_scheduler.step()
 
-        lr_scheduler.step()
+        if not hparams.lr_scheduler == SchedulerTypes.cyclic:
+            # TODO: для plateau ошибка валидации должна рассчитываться в конце каждой эпохи, по-хорошему
+            scheduler_args = () if hparams.lr_scheduler != SchedulerTypes.plateau else (val_loss,)
+            lr_scheduler.step(*scheduler_args)
 
 
 if __name__ == "__main__":
@@ -382,6 +352,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     hparams = create_hparams(args.hparams_path)
+    hparams.path = args.hparams_path
 
     n_gpus = 0
     rank = 0
@@ -397,12 +368,12 @@ if __name__ == "__main__":
         device = hparams.device.split(":")
         device = device[0] + ":0" if len(device) == 1 else ":".join(device)
 
-    hparams.device = torch.device(device)
+    device = torch.device(device)
 
-    if hparams.device.type != "cpu":
+    if device.type != "cpu":
         assert torch.cuda.is_available()
 
-        torch.cuda.set_device(hparams.device)
+        torch.cuda.set_device(device)
         if args.distributed_run:
             init_distributed(hparams, n_gpus, rank, args.group_name)
 

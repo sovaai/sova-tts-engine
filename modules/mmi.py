@@ -13,7 +13,7 @@ class MIEsitmator(torch.nn.Module):
 
         self.device = torch.device("cpu" if not torch.cuda.is_available() else hparams.device)
 
-        vocab_size = get_ctc_symbols_length(hparams.language)
+        vocab_size = get_ctc_symbols_length(hparams.charset)
         decoder_dim = hparams.decoder_rnn_dim
 
         self.use_gaf = hparams.use_gaf
@@ -24,7 +24,7 @@ class MIEsitmator(torch.nn.Module):
             torch.nn.Dropout(p=dropout)
         )
         self.ctc_proj = LinearNorm(decoder_dim, vocab_size, bias=True)
-        self.ctc = torch.nn.CTCLoss(blank=vocab_size - 1, reduction="none")
+        self.ctc = torch.nn.CTCLoss(blank=vocab_size - 1, reduction="none", zero_infinity=True)
 
         self.to(self.device)
 

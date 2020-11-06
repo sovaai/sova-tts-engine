@@ -65,7 +65,6 @@ class LossScaler:
 
 
 class DynamicLossScaler:
-
     def __init__(self,
                  init_scale=2 ** 32,
                  scale_factor=2.,

@@ -37,8 +37,8 @@ from numpy import finfo
 from torch.autograd import Variable
 from torch import nn
 from torch.nn import functional as F
-from tps import get_symbols_length
-from tps.utils import prob2bool
+
+from tps import get_symbols_length, prob2bool
 
 from modules.layers import ConvNorm, ConvBlock, LinearNorm, activation_func
 from modules.gst import GST
@@ -87,14 +87,14 @@ class Attention(nn.Module):
             out_dim=attention_dim,
             bias=False,
             initscheme=initscheme,
-            nonlinearity='tanh'
+            nonlinearity="tanh"
         )
         self.memory_layer = LinearNorm(
             in_dim=embedding_dim,
             out_dim=attention_dim,
             bias=False,
             initscheme=initscheme,
-            nonlinearity='tanh'
+            nonlinearity="tanh"
         )
         self.v = LinearNorm(in_dim=attention_dim, out_dim=1, bias=False, initscheme=initscheme)
         self.location_layer = LocationLayer(
@@ -181,7 +181,6 @@ class Postnet(nn.Module):
     """Postnet
         - Five 1-d convolution with 512 channels and kernel size 5
     """
-
     def __init__(self, hparams):
         super(Postnet, self).__init__()
         self.convolutions = nn.ModuleList()
@@ -271,12 +270,20 @@ class Encoder(nn.Module):
 
 
     def inference(self, x):
-        x = self.convolutions(x)
+        try:
+            with torch.no_grad():
+                x = self.convolutions(x)
 
-        x = x.transpose(1, 2)
+                x = x.transpose(1, 2)
 
-        self.lstm.flatten_parameters()
-        outputs, _ = self.lstm(x)
+                self.lstm.flatten_parameters()
+                outputs, _ = self.lstm(x)
+
+        except RuntimeError as e:
+            torch.cuda.empty_cache()
+            outputs = None
+
+        torch.cuda.empty_cache()
 
         return outputs
 
@@ -333,8 +340,7 @@ class Decoder(nn.Module):
                 in_dim=hparams.decoder_rnn_dim + hparams.encoder_embedding_dim,
                 out_dim=lp_out_dim,
                 bias=True,
-                initscheme=hparams.initscheme,
-                nonlinearity='relu'
+                initscheme=hparams.initscheme
             )
         else:
             self.linear_projection = nn.Sequential(
@@ -343,7 +349,7 @@ class Decoder(nn.Module):
                     out_dim=lp_out_dim,
                     bias=True,
                     initscheme=hparams.initscheme,
-                    nonlinearity='relu'
+                    nonlinearity="relu"
                 ),
                 nn.ReLU(),
                 nn.Dropout(p=0.5),
@@ -439,7 +445,7 @@ class Decoder(nn.Module):
         decoder_inputs = decoder_inputs.transpose(1, 2)
         decoder_inputs = decoder_inputs.view(
             decoder_inputs.size(0),
-            int(decoder_inputs.size(1)/self.n_frames_per_step), -1)
+            int(decoder_inputs.size(1) / self.n_frames_per_step), -1)
         # (B, T_out, n_mel_channels) -> (T_out, B, n_mel_channels)
         decoder_inputs = decoder_inputs.transpose(0, 1)
         return decoder_inputs
@@ -627,9 +633,9 @@ class Tacotron2(nn.Module):
         self.n_mel_channels = hparams.n_mel_channels
         self.n_frames_per_step = hparams.n_frames_per_step
 
-        self.embedding = nn.Embedding(get_symbols_length(hparams.language), hparams.symbols_embedding_dim)
+        self.embedding = nn.Embedding(get_symbols_length(hparams.charset), hparams.symbols_embedding_dim)
 
-        std = sqrt(2.0 / (get_symbols_length(hparams.language) + hparams.symbols_embedding_dim))
+        std = sqrt(2.0 / (get_symbols_length(hparams.charset) + hparams.symbols_embedding_dim))
         val = sqrt(3.0) * std  # uniform bounds for std
         self.embedding.weight.data.uniform_(-val, val)
 
@@ -711,7 +717,7 @@ class Tacotron2(nn.Module):
         encoder_outputs = self.encoder(embedded_inputs, text_lengths)
 
         if self.gst is not None:
-            gst_outputs = self.gst(mels, encoder_outputs=encoder_outputs, text_lengths=text_lengths)
+            gst_outputs = self.gst(inputs=mels, input_lengths=output_lengths)
             encoder_outputs += gst_outputs.style_emb.expand_as(encoder_outputs)
 
         p_teacher_forcing = 1.0

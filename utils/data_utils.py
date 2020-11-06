@@ -37,9 +37,8 @@ import librosa
 import torch
 import torch.utils.data
 from scipy.io.wavfile import read
-from tps import Handler
-from tps.utils import prob2bool
-import tps.symbols as symb
+
+from tps import prob2bool, symbols, cleaners
 
 from modules import layers
 from utils.utils import load_filepaths_and_text, Inputs, InputsCTC
@@ -47,94 +46,30 @@ from modules.loss_function import AttentionTypes
 
 
 ctc_mapping = {
-    symb.Languages.en: symb.LETTERS_EN,
-    symb.Languages.ru: symb.LETTERS_RU,
-    symb.Languages.ru_trans: symb.LETTERS_RU_TRANS
+    symbols.Charset.en: symbols.EN_SET,
+    symbols.Charset.ru: symbols.RU_SET,
+    symbols.Charset.ru_trans: symbols.RU_TRANS_SET
 }
 
 
-def get_ctc_symbols(language):
-    return ctc_mapping[language] + ["_"]
+def get_ctc_symbols(charset):
+    return ["pad"] + ctc_mapping[charset] + ["blank"]
 
 
-def get_ctc_symbols_length(language):
-    language = symb.Languages[language]
-    return len(get_ctc_symbols(language))
-
-
-class CustomSampler(torch.utils.data.Sampler):
-    def __init__(self, data_source, batchsize, shuffle=False, optimize=False, len_diff=10):
-        idxs = tuple(range(len(data_source.data)))
-
-        self.optimize = optimize
-        self.shuffle = shuffle
-        self.batchsize = batchsize
-        self.optimized_idxs = []
-
-        if self.optimize:
-            text_lengths = tuple(len(elem[1]) for elem in data_source.data)
-            lengths_idxs_pairs = tuple(zip(text_lengths, idxs))
-
-            lengths_idxs_pairs = sorted(lengths_idxs_pairs, key=lambda elem: elem[0])
-
-            min_length = lengths_idxs_pairs[0][0]
-
-            len_idxs = []
-            min_len = min_length
-            max_len = min_len + len_diff
-            for j, (length, idx) in enumerate(lengths_idxs_pairs):
-                if min_len <= length < max_len:
-                    len_idxs.append(idx)
-                    if j + 1 == len(lengths_idxs_pairs) and len_idxs:
-                        self.optimized_idxs.append(len_idxs)
-                else:
-                    self.optimized_idxs.append(len_idxs)
-                    len_idxs = [idx]
-                    min_len = length
-                    max_len = min_len + len_diff
-
-            idxs = tuple(chain(*self.optimized_idxs))
-
-        self.idxs = idxs
-
-        if self.shuffle:
-            self.reshuffle()
-
-
-    def __iter__(self):
-        for i in self.idxs:
-            yield i
-
-        if self.shuffle:
-            self.reshuffle()
-
-
-    def __len__(self):
-        return len(self.idxs)
-
-
-    def reshuffle(self):
-        def _torch_shuffle(iterable):
-            return tuple(iterable[i] for i in torch.randperm(len(iterable)).tolist())
-
-
-        idxs = tuple(_torch_shuffle(elem) for elem in self.optimized_idxs) if self.optimize else self.idxs
-        idxs = _torch_shuffle(idxs)
-
-        if self.optimize:
-            idxs = list(chain(*idxs))
-
-            batches = len(idxs) // self.batchsize
-            idxs = tuple(idxs[i * self.batchsize:(i + 1) * self.batchsize] for i in range(batches))
-            idxs = _torch_shuffle(idxs)
-
-            idxs = list(chain(*idxs))
-
-        self.idxs = idxs
+def get_ctc_symbols_length(charset):
+    charset = symbols.Charset[charset]
+    return len(get_ctc_symbols(charset))
 
 
 class TextMelLoader(torch.utils.data.Dataset):
-    def __init__(self, filelist_path, hparams):
+    """
+        1) loads audio,text pairs
+        2) normalizes text and converts them to sequences of one-hot vectors
+        3) computes mel-spectrograms from audio files.
+    """
+    def __init__(self, text_handler, filelist_path, hparams):
+        self.text_handler = text_handler
+
         self.data = load_filepaths_and_text(filelist_path)
         self.audio_path = hparams.audios_path
         self.alignment_path = hparams.alignments_path
@@ -145,7 +80,6 @@ class TextMelLoader(torch.utils.data.Dataset):
         self.trim_silence = hparams.trim_silence
         self.trim_top_db = hparams.trim_top_db
 
-        self.text_cleaners = hparams.text_cleaners
         self.max_wav_value = hparams.max_wav_value
         self.sampling_rate = hparams.sampling_rate
         self.load_mel_from_disk = hparams.load_mel_from_disk
@@ -155,59 +89,48 @@ class TextMelLoader(torch.utils.data.Dataset):
             hparams.n_mel_channels, hparams.sampling_rate, hparams.mel_fmin,
             hparams.mel_fmax)
 
-        self.get_alignments = hparams.guided_attention_type == AttentionTypes.prealigned
         self.word_level_prob = hparams.word_level_prob
-        self.stress = hparams.stress
-        self.phonemes = hparams.phonemes
-        self.dict_prime = hparams.dict_prime
+        self.mask_stress = hparams.mask_stress
+        self.mask_phonemes = hparams.mask_phonemes
 
-        self.text_handler = Handler(hparams.language, hparams.dict_path)
+        self.get_alignments = hparams.guided_attention_type == AttentionTypes.prealigned
+        if self.get_alignments:
+            assert not self.word_level_prob and not self.add_silence
 
         self.use_mmi = hparams.use_mmi
         self.ctc_symbol_to_id = None
         if hparams.use_mmi:
-            self.ctc_symbol_to_id = {s: i for i, s in enumerate(get_ctc_symbols(hparams.language))}
+            self.ctc_symbol_to_id = {s: i for i, s in enumerate(get_ctc_symbols(hparams.charset))}
 
 
     def __getitem__(self, index):
-        return self.get_data(self.data[index])
+        if isinstance(index, slice):
+            return (self.get_data(data) for data in self.data[index])
+        else:
+            return self.get_data(self.data[index])
 
 
     def __len__(self):
         return len(self.data)
 
 
-    def _get_sress_phonemes(self):
-        if not self.word_level_prob:
-            phonemes = prob2bool(self.phonemes) if isinstance(self.phonemes, (int, float)) else self.phonemes
-            stress = prob2bool(self.stress) if isinstance(self.stress, (int, float)) else self.stress
-        else:
-            phonemes = self.phonemes
-            stress = self.stress
-
-        return stress, phonemes
+    def _prob2bool(self, prob):
+        return prob2bool(prob) if not self.word_level_prob else prob
 
 
-    # get mel and text
     def get_data(self, sample):
-        stress, phonemes = self._get_sress_phonemes()
+        mask_stress =  self._prob2bool(self.mask_stress)
+        mask_phonemes = self._prob2bool(self.mask_phonemes)
+
         audio_name, text = sample
 
-        sequence = self.get_text(text, stress, phonemes)
+        sequence = self.get_text(text, mask_stress, mask_phonemes)
         mel = self.get_mel(audio_name)
 
         alignment = None
         if self.get_alignments:
-            assert not self.word_level_prob and not self.add_silence
-            alignment = self.get_alignment(audio_name, stress, phonemes)
-            # TODO: поправить эту хрень с alignment
-            if alignment is None or (mel.size(1), sequence.size(0)) != alignment.shape:
-                print("Some problems with {}: expected {} shape, got {}".format(audio_name,
-                                                                                (mel.size(1), sequence.size(0)),
-                                                                                alignment.shape))
-                alignment = np.zeros(shape=(mel.shape[1], sequence.shape[0]))
-
-            alignment = torch.FloatTensor(alignment)
+            target_shape = (mel.size(1), sequence.size(0))
+            alignment = self.get_alignment(audio_name, mask_stress, mask_phonemes, target_shape)
 
         ctc_sequence = None
         if self.use_mmi:
@@ -216,20 +139,23 @@ class TextMelLoader(torch.utils.data.Dataset):
         return sequence, mel, alignment, ctc_sequence
 
 
-    def get_text(self, text, stress, phonemes):
-        stress_always = not self.get_alignments
-        text_norm = torch.IntTensor(
-            self.text_handler.text_to_sequence(text, self.text_cleaners, stress, phonemes, self.dict_prime,
-                                               stress_always)
+    def get_text(self, text, mask_stress, mask_phonemes):
+        preprocessed_text = self.text_handler(
+            text, cleaners.light_punctuation_cleaners, None, False,
+            mask_stress=mask_stress, mask_phonemes=mask_phonemes
         )
-        return text_norm
+        preprocessed_text = self.text_handler.check_eos(" ".join(preprocessed_text))
+        text_vector = self.text_handler.text2vec(preprocessed_text)
+
+        text_tensor = torch.IntTensor(text_vector)
+        return text_tensor
 
 
     def get_audio(self, filename, trim_silence=False, add_silence=False):
         filepath = os.path.join(self.audio_path, filename)
 
         sample_rate, audio = read(filepath)
-        audio = np.float32(audio / self.max_wav_value)  # faster than loading using librosa
+        audio = np.float32(audio / self.max_wav_value) # faster than loading using librosa
 
         if sample_rate != self.sampling_rate:
             raise ValueError("{} SR doesn't match target {} SR".format(sample_rate, self.sampling_rate))
@@ -276,21 +202,30 @@ class TextMelLoader(torch.utils.data.Dataset):
         return melspec
 
 
-    def get_alignment(self, audio_name, stress, phonemes):
+    def get_alignment(self, audio_name, mask_stress, mask_phonemes, target_shape):
         audio_name, _ = os.path.splitext(audio_name)
         alignment_name = audio_name + ".npy"
 
-        if phonemes:
-            return None  # у нас пока нет выравниваний для фонемного представления
+        if not mask_phonemes:
+            alignment = None # у нас пока нет выравниваний для фонемного представления
+        else:
+            sub_dir = "original" if mask_stress else "stressed"
+            filepath = os.path.join(self.alignment_path[sub_dir], alignment_name)
 
-        sub_dir = "original" if not stress else "stressed"
-        filepath = os.path.join(self.alignment_path[sub_dir], alignment_name)
+            alignment = np.load(filepath)
 
-        return np.load(filepath)
+        # TODO: поправить эту хрень с alignment
+        if alignment is None or alignment.shape != target_shape:
+            print("Some problems with {}: expected {} shape, got {}".format(audio_name, target_shape, alignment.shape))
+            alignment = np.zeros(shape=target_shape)
+
+        alignment = torch.FloatTensor(alignment)
+
+        return alignment
 
 
     def get_ctc_text(self, sequence):
-        text = [self.text_handler._id_to_symbol[s] for s in sequence]
+        text = [self.text_handler.id_to_symbol[s] for s in sequence]
         return torch.IntTensor([self.ctc_symbol_to_id[s] for s in text if s in self.ctc_symbol_to_id])
 
 
@@ -375,3 +310,73 @@ class TextMelCollate:
         inputs_ctc = InputsCTC(text=ctc_text_padded, length=ctc_text_lengths) if get_ctc_text else None
 
         return inputs, alignments_padded, inputs_ctc
+
+
+class CustomSampler(torch.utils.data.Sampler):
+    def __init__(self, data_source, batchsize, shuffle=False, optimize=False, len_diff=10):
+        idxs = tuple(range(len(data_source.data)))
+
+        self.optimize = optimize
+        self.shuffle = shuffle
+        self.batchsize = batchsize
+        self.optimized_idxs = []
+
+        if self.optimize:
+            text_lengths = tuple(len(elem[1]) for elem in data_source.data)
+            lengths_idxs_pairs = tuple(zip(text_lengths, idxs))
+
+            lengths_idxs_pairs = sorted(lengths_idxs_pairs, key=lambda elem: elem[0])
+
+            min_length = lengths_idxs_pairs[0][0]
+
+            len_idxs = []
+            min_len = min_length
+            max_len = min_len + len_diff
+            for j, (length, idx) in enumerate(lengths_idxs_pairs):
+                if min_len <= length < max_len:
+                    len_idxs.append(idx)
+                    if j + 1 == len(lengths_idxs_pairs) and len_idxs:
+                        self.optimized_idxs.append(len_idxs)
+                else:
+                    self.optimized_idxs.append(len_idxs)
+                    len_idxs = [idx]
+                    min_len = length
+                    max_len = min_len + len_diff
+
+            idxs = tuple(chain(*self.optimized_idxs))
+
+        self.idxs = idxs
+
+        if self.shuffle:
+            self.reshuffle()
+
+
+    def __iter__(self):
+        for i in self.idxs:
+            yield i
+
+        if self.shuffle:
+            self.reshuffle()
+
+
+    def __len__(self):
+        return len(self.idxs)
+
+
+    def reshuffle(self):
+        def _torch_shuffle(iterable):
+            return tuple(iterable[i] for i in torch.randperm(len(iterable)).tolist())
+
+        idxs = tuple(_torch_shuffle(elem) for elem in self.optimized_idxs) if self.optimize else self.idxs
+        idxs = _torch_shuffle(idxs)
+
+        if self.optimize:
+            idxs = list(chain(*idxs))
+
+            batches = len(idxs) // self.batchsize
+            idxs = tuple(idxs[i * self.batchsize:(i + 1) * self.batchsize] for i in range(batches))
+            idxs = _torch_shuffle(idxs)
+
+            idxs = list(chain(*idxs))
+
+        self.idxs = idxs
