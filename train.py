@@ -172,7 +172,7 @@ def save_checkpoint(model, optimizer, lr_scheduler, criterion, iteration, hparam
         "state_dict": model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "lr_scheduler": lr_scheduler.state_dict(),
-        "hparams": hparams.dumps()
+        "hparams": hparams.export()
     }
 
     if criterion.mmi_criterion is not None:

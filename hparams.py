@@ -30,7 +30,6 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 """
 import yaml
-import json
 
 
 class AttributeDict(dict):
@@ -59,8 +58,8 @@ class AttributeDict(dict):
         pass
 
 
-    def dumps(self):
-        return json.dumps(self)
+    def export(self):
+        return dict(self)
 
 
 def create_hparams(config_source):
