@@ -164,7 +164,7 @@ class Prenet(nn.Module):
         layers = []
         for in_size, out_size in zip(in_sizes, sizes):
             layers.extend([
-                LinearNorm(in_size, out_size, bias=False, initscheme=initscheme, nonlinearity=activation),
+                LinearNorm(in_size, out_size, bias=False, initscheme=initscheme, nonlinearity="linear"),
                 activation_func(activation)
             ])
 
@@ -172,8 +172,8 @@ class Prenet(nn.Module):
 
 
     def forward(self, x):
-        for linear in self.layers:
-            x = F.dropout(linear(x), p=0.5, training=True)
+        for layer in self.layers:
+            x = F.dropout(layer(x), p=0.5, training=True) if isinstance(layer, LinearNorm) else layer(x)
         return x
 
 
