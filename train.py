@@ -35,6 +35,7 @@ import time
 import math
 import argparse
 from shutil import copyfile
+from itertools import chain
 
 import numpy as np
 from collections import OrderedDict
@@ -232,9 +233,13 @@ def train(hparams, distributed_run=False, rank=0, n_gpus=None):
     torch.cuda.manual_seed(hparams.seed)
 
     model = load_model(hparams, distributed_run)
-    optimizer = build_optimizer(model, hparams)
-    lr_scheduler = build_scheduler(optimizer, hparams)
     criterion = OverallLoss(hparams)
+    if criterion.mmi_criterion is not None:
+        parameters = chain(model.parameters(), criterion.mmi_criterion.parameters())
+    else:
+        parameters = model.parameters()
+    optimizer = build_optimizer(parameters, hparams)
+    lr_scheduler = build_scheduler(optimizer, hparams)
 
     if hparams.fp16_run:
         from apex import amp
@@ -269,8 +274,6 @@ def train(hparams, distributed_run=False, rank=0, n_gpus=None):
     for epoch in range(epoch_offset, hparams.epochs):
         print("Epoch: {}".format(epoch))
         for i, batch in enumerate(train_loader):
-            torch.cuda.empty_cache()
-
             start = time.perf_counter()
 
             model.zero_grad()

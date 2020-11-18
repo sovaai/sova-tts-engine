@@ -36,7 +36,7 @@ optimizers_options = {
 }
 
 
-def build_optimizer(model, hparams):
+def build_optimizer(parameters, hparams):
     optimizer_type = OptimizersTypes[hparams.optimizer]
     optimizer_opts = {} if hparams.optim_options is None else hparams.optim_options
 
@@ -47,7 +47,7 @@ def build_optimizer(model, hparams):
                              format(optimizer_type, optimizers[optimizer_type].__doc__))
 
         optimizer = optimizers[optimizer_type](
-            model.parameters(),
+            parameters,
             lr=hparams.learning_rate,
             weight_decay=hparams.weight_decay,
             **optimizer_opts
