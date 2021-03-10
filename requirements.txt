@@ -1,8 +1,10 @@
-torch>=1.6.0
+torch==1.7.0
 scipy==1.4.1
 librosa==0.8.0
 matplotlib==2.1.0
-numpy==1.13.3
+numpy==1.15.0
 torch_optimizer==0.0.1a15
+tensorboard==1.15.0
 tqdm
+pyaml
 -e git+https://github.com/sovaai/sova-tts-tps@v1.1.0#egg=TPS

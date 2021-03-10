@@ -226,7 +226,7 @@ def validate(model, criterion, valset, iteration, batch_size, collate_fn, logger
         num_batches = len(val_loader)
         reduced_losses_dict = {key: [reduce_loss(l, distributed_run, n_gpus) for l in value]
                                for key, value in losses_dict.items()}
-        reduced_losses_dict = {key: value / num_batches for key, value in reduced_losses_dict.items()}
+        reduced_losses_dict = {key: sum(value) / num_batches for key, value in reduced_losses_dict.items()}
 
     model.train()
     if rank == 0:
