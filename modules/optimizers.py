@@ -78,11 +78,25 @@ class SchedulerTypes(str, Enum):
     cyclic = "cyclic"
 
 
+class ReduceLROnPlateau(optim.lr_scheduler.ReduceLROnPlateau):
+    def __init__(self, optimizer, mode='min', factor=0.1, patience=10,
+                 verbose=False, threshold=1e-4, threshold_mode='rel',
+                 cooldown=0, min_lr=0, eps=1e-8):
+        super(ReduceLROnPlateau, self).__init__(optimizer, mode, factor, patience,
+                 verbose, threshold, threshold_mode, cooldown, min_lr, eps)
+
+        self._last_lr = [group['lr'] for group in self.optimizer.param_groups]
+
+
+    def get_last_lr(self):
+        return self._last_lr
+
+
 schedulers = {
     SchedulerTypes.none: FakeScheduler,
     SchedulerTypes.multi_step: optim.lr_scheduler.MultiStepLR,
     SchedulerTypes.exponential: optim.lr_scheduler.ExponentialLR,
-    SchedulerTypes.plateau: optim.lr_scheduler.ReduceLROnPlateau,
+    SchedulerTypes.plateau: ReduceLROnPlateau,
     SchedulerTypes.cyclic: optim.lr_scheduler.CyclicLR
 }
 

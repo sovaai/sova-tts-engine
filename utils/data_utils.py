@@ -46,9 +46,9 @@ from modules.loss_function import AttentionTypes
 
 
 ctc_mapping = {
-    symbols.Charset.en: symbols.EN_SET,
-    symbols.Charset.ru: symbols.RU_SET,
-    symbols.Charset.ru_trans: symbols.RU_TRANS_SET
+    symbols.Charset.en: symbols.en.EN_SET,
+    symbols.Charset.ru: symbols.ru.RU_SET,
+    symbols.Charset.ru_trans: symbols.ru.RU_TRANS_SET
 }
 
 
@@ -140,11 +140,11 @@ class TextMelLoader(torch.utils.data.Dataset):
 
 
     def get_text(self, text, mask_stress, mask_phonemes):
-        preprocessed_text = self.text_handler(
+        preprocessed_text = self.text_handler.process_text(
             text, cleaners.light_punctuation_cleaners, None, False,
             mask_stress=mask_stress, mask_phonemes=mask_phonemes
         )
-        preprocessed_text = self.text_handler.check_eos(" ".join(preprocessed_text))
+        preprocessed_text = self.text_handler.check_eos(preprocessed_text)
         text_vector = self.text_handler.text2vec(preprocessed_text)
 
         text_tensor = torch.IntTensor(text_vector)

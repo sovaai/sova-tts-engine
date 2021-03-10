@@ -1,7 +1,7 @@
 handler:
   out_max_length:
-  charset: ru_trans
-  modules: [emphasizer, phonetizer]
+  charset: ru
+  modules: [emphasizer]
 
 emphasizer:
   type: rule_based # Union[nn_based, rule_based]

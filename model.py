@@ -254,12 +254,9 @@ class Encoder(nn.Module):
 
     def forward(self, x, input_lengths):
         x = self.convolutions(x)
-
         x = x.transpose(1, 2)
 
-        # pytorch tensor are not reversible, hence the conversion
-        input_lengths = input_lengths.cpu().numpy()
-        x = nn.utils.rnn.pack_padded_sequence(x, input_lengths, batch_first=True)
+        x = nn.utils.rnn.pack_padded_sequence(x, input_lengths.cpu(), batch_first=True)
 
         self.lstm.flatten_parameters()
         outputs, _ = self.lstm(x)
@@ -270,20 +267,12 @@ class Encoder(nn.Module):
 
 
     def inference(self, x):
-        try:
-            with torch.no_grad():
-                x = self.convolutions(x)
+        x = self.convolutions(x)
 
-                x = x.transpose(1, 2)
+        x = x.transpose(1, 2)
 
-                self.lstm.flatten_parameters()
-                outputs, _ = self.lstm(x)
-
-        except RuntimeError as e:
-            torch.cuda.empty_cache()
-            outputs = None
-
-        torch.cuda.empty_cache()
+        self.lstm.flatten_parameters()
+        outputs, _ = self.lstm(x)
 
         return outputs
 
@@ -462,19 +451,19 @@ class Decoder(nn.Module):
         RETURNS
         -------
         mel_outputs:
-        gate_outpust: gate output energies
+        gate_outputs: gate output energies
         alignments:
         """
-        # (T_out, B) -> (B, T_out)
+        # [(B, T_in) x T_out] -> (B, T_out, T_in)
         alignments = torch.stack(alignments).transpose(0, 1)
-        # (T_out, B) -> (B, T_out)
-        gate_outputs = torch.stack(gate_outputs).transpose(0, 1)
-        gate_outputs = gate_outputs.contiguous()
-        # (T_out, B, n_mel_channels) -> (B, T_out, n_mel_channels)
-        mel_outputs = torch.stack(mel_outputs).transpose(0, 1).contiguous()
+
+        # [(B, 1) x T_out] -> (B, T_out)
+        gate_outputs = torch.cat(gate_outputs, dim=1).contiguous()
+
+        # [(B, 1, n_mel_channels) x T_out] -> (B, T_out, n_mel_channels)
+        mel_outputs = torch.cat(mel_outputs, dim=1)
         # decouple frames per step
-        mel_outputs = mel_outputs.view(
-            mel_outputs.size(0), -1, self.n_mel_channels)
+        mel_outputs = mel_outputs.view(mel_outputs.size(0), -1, self.n_mel_channels)
         # (B, T_out, n_mel_channels) -> (B, n_mel_channels, T_out)
         mel_outputs = mel_outputs.transpose(1, 2)
 
@@ -567,16 +556,18 @@ class Decoder(nn.Module):
 
             mel_output, gate_output, attention_weights, decoder_output = self.decode(decoder_input)
 
-            mel_outputs += [mel_output.squeeze(1)]
-            gate_outputs += [gate_output.squeeze(1)]
-            alignments += [attention_weights]
+            mel_outputs.append(mel_output)
+            gate_outputs.append(gate_output)
+            alignments.append(attention_weights)
+
             if decoder_output is not None:
-                decoder_outputs += [decoder_output.squeeze(1)]
+                decoder_outputs.append(decoder_output)
 
         mel_outputs, gate_outputs, alignments, decoder_outputs = self.parse_decoder_outputs(
             mel_outputs, gate_outputs, alignments, decoder_outputs)
 
         return mel_outputs, gate_outputs, alignments, decoder_outputs
+
 
 
     def inference(self, memory, max_decoder_steps=None, suppress_gate=False):
@@ -602,12 +593,12 @@ class Decoder(nn.Module):
             decoder_input = self.prenet(decoder_input)
             mel_output, gate_output, alignment, decoder_output = self.decode(decoder_input)
 
-            mel_outputs += [mel_output.squeeze(1)]
-            gate_outputs += [gate_output.squeeze(1)]
-            alignments += [alignment]
+            mel_outputs.append(mel_output)
+            gate_outputs.append(gate_output)
+            alignments.append(alignment)
 
             if decoder_output is not None:
-                decoder_outputs += [decoder_output.squeeze(1)]
+                decoder_outputs.append(decoder_output)
 
             if not suppress_gate and torch.sigmoid(gate_output.data) > self.gate_threshold:
                 break
@@ -687,12 +678,10 @@ class Tacotron2(nn.Module):
     def parse_output(self, outputs, output_lengths=None, text_lengths=None):
         if self.mask_padding and output_lengths is not None:
             mask = ~utl.get_mask_from_lengths(output_lengths)
-            mel_mask = mask.expand(self.n_mel_channels, mask.size(0), mask.size(1))
-            mel_mask = mel_mask.permute(1, 0, 2)
+            outputs.mels.data.masked_fill_(mask.unsqueeze(1), 0.0)
+            outputs.mels_postnet.data.masked_fill_(mask.unsqueeze(1), 0.0)
+            outputs.gate.data.masked_fill_(mask, 1e3)
 
-            outputs.mels.data.masked_fill_(mel_mask, 0.0)
-            outputs.mels_postnet.data.masked_fill_(mel_mask, 0.0)
-            outputs.gate.data.masked_fill_(mel_mask[:, 0, :], 1e3)
             if text_lengths is not None:
                 outputs.alignments.data.masked_fill_(~utl.get_mask_3d(output_lengths, text_lengths), 0.0)
 
@@ -702,8 +691,7 @@ class Tacotron2(nn.Module):
     def mask_decoder_output(self, decoder_outputs, output_lengths=None):
         if self.mask_padding and output_lengths is not None:
             mask = ~utl.get_mask_from_lengths(output_lengths)
-            float_mask = (~mask).float().unsqueeze(1)
-            decoder_outputs *= float_mask
+            decoder_outputs.data.masked_fill_(mask.unsqueeze(1), 0.0)
 
         return decoder_outputs
 
@@ -717,7 +705,7 @@ class Tacotron2(nn.Module):
         encoder_outputs = self.encoder(embedded_inputs, text_lengths)
 
         if self.gst is not None:
-            gst_outputs = self.gst(inputs=mels, input_lengths=output_lengths)
+            gst_outputs = self.gst(inputs=mels.transpose(2, 1), input_lengths=output_lengths)
             encoder_outputs += gst_outputs.style_emb.expand_as(encoder_outputs)
 
         p_teacher_forcing = 1.0

@@ -93,7 +93,7 @@ class ConvBlock(torch.nn.Module):
                 stride=stride,
                 padding=int(dilation * (kernel_size - 1) / 2) if padding is None else padding,
                 dilation=dilation,
-                bias=bias,
+                bias=bias and not bn,
                 initscheme=initscheme,
                 nonlinearity=nonlinearity
             )
@@ -118,7 +118,7 @@ class ConvNorm(torch.nn.Module):
                  padding=None, dilation=1, bias=True, initscheme="xavier_uniform", nonlinearity="linear"):
         super(ConvNorm, self).__init__()
         if dimensions == 1 and padding is None:
-            assert(kernel_size % 2 == 1)
+            assert (kernel_size % 2 == 1)
             padding = int(dilation * (kernel_size - 1) / 2)
 
         self.conv = conv_types[dimensions](in_channels, out_channels,

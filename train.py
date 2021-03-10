@@ -30,17 +30,15 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 """
 import os
-import re
 import time
-import math
 import argparse
 from shutil import copyfile
 from itertools import chain
-
-import numpy as np
 from collections import OrderedDict
 
+from tqdm import tqdm
 import torch
+from torch.cuda import amp
 import torch.distributed as dist
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data import DataLoader
@@ -89,10 +87,12 @@ def init_distributed(hparams, n_gpus, rank, group_name):
 
 def prepare_dataloaders(hparams, distributed_run=False):
     # Get data, data loaders and collate function ready
-    assert isinstance(hparams.text_handler_cfg, str)
-    text_handler = Handler.from_config(hparams.text_handler_cfg)
-    text_handler.out_max_length = None
-    assert text_handler.charset.value == hparams.charset
+    if isinstance(hparams.text_handler_cfg, str):
+        text_handler = Handler.from_config(hparams.text_handler_cfg)
+        text_handler.out_max_length = None
+        assert text_handler.charset.value == hparams.charset
+    else:
+        text_handler = Handler.from_charset(hparams.charset, data_dir="data", silent=True)
 
     trainset = TextMelLoader(text_handler, hparams.training_files, hparams)
     valset = TextMelLoader(text_handler, hparams.validation_files, hparams)
@@ -122,17 +122,29 @@ def prepare_directories_and_logger(output_directory, log_directory, rank):
     return logger
 
 
-def warm_start_model(checkpoint_path, model, ignore_layers):
+def warm_start_model(checkpoint_path, model, ignore_layers, ignore_mismatched_layers=False):
     assert os.path.isfile(checkpoint_path)
     print("Warm starting model from checkpoint '{}'".format(checkpoint_path))
     checkpoint_dict = torch.load(checkpoint_path, map_location="cpu")
-    model_dict = checkpoint_dict["state_dict"]
+    pretrained_dict = checkpoint_dict["state_dict"]
+    model_dict = model.state_dict()
+
+    # remove extra keys
+    pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}
+
+    if ignore_mismatched_layers:
+        auto_ignore_layers = []
+        for k, v in pretrained_dict.items():
+            if v.data.shape != model_dict[k].data.shape:
+                auto_ignore_layers.append(k)
+        print("Automatically ignored the following pretrained checkpoint keys: ", auto_ignore_layers)
+        ignore_layers.extend(auto_ignore_layers)
+
     if len(ignore_layers) > 0:
-        model_dict = {k: v for k, v in model_dict.items()
-                      if not any(re.search(layer, k) for layer in ignore_layers)}
-        dummy_dict = model.state_dict()
-        dummy_dict.update(model_dict)
-        model_dict = dummy_dict
+        pretrained_dict = {k: v for k, v in pretrained_dict.items()
+                           if not any(layer in k for layer in ignore_layers)}
+
+    model_dict.update(pretrained_dict)
     model.load_state_dict(model_dict)
     return model
 
@@ -195,6 +207,7 @@ def validate(model, criterion, valset, iteration, batch_size, collate_fn, logger
                                 shuffle=shuffle, batch_size=batch_size,
                                 pin_memory=False, collate_fn=collate_fn)
 
+        val_loader = tqdm(val_loader, desc="Running validation...") if rank == 0 else val_loader
         for i, batch in enumerate(val_loader):
             inputs, alignments, inputs_ctc = model.parse_batch(batch)
 
@@ -210,14 +223,14 @@ def validate(model, criterion, valset, iteration, batch_size, collate_fn, logger
             for loss_name, loss_value in losses.items():
                 losses_dict[loss_name].append(loss_value)
 
+        num_batches = len(val_loader)
         reduced_losses_dict = {key: [reduce_loss(l, distributed_run, n_gpus) for l in value]
                                for key, value in losses_dict.items()}
-        reduced_losses_dict = {key: np.mean(value) for key, value in reduced_losses_dict.items()}
+        reduced_losses_dict = {key: value / num_batches for key, value in reduced_losses_dict.items()}
 
     model.train()
     if rank == 0:
-        print("Validation loss {}: {:9f}  ".format(iteration, reduced_losses_dict["overall/loss"]))
-        print()
+        print("Validation loss {}: {:9f}\n".format(iteration, reduced_losses_dict["overall/loss"]))
         logger.log_validation(reduced_losses_dict, model, inputs, outputs, iteration, alignments)
 
     return reduced_losses_dict["overall/loss"]
@@ -241,13 +254,9 @@ def train(hparams, distributed_run=False, rank=0, n_gpus=None):
     optimizer = build_optimizer(parameters, hparams)
     lr_scheduler = build_scheduler(optimizer, hparams)
 
-    if hparams.fp16_run:
-        from apex import amp
-        model, optimizer = amp.initialize(
-            model, optimizer, opt_level="O2")
-
     if distributed_run:
         model = apply_gradient_allreduce(model)
+    scaler = amp.GradScaler(enabled=hparams.fp16_run)
 
     logger = prepare_directories_and_logger(hparams.output_dir, hparams.log_dir, rank)
     copyfile(hparams.path, os.path.join(hparams.output_dir, 'hparams.yaml'))
@@ -259,7 +268,7 @@ def train(hparams, distributed_run=False, rank=0, n_gpus=None):
     if hparams.checkpoint is not None:
         if hparams.warm_start:
             model = warm_start_model(
-                hparams.checkpoint, model, hparams.ignore_layers)
+                hparams.checkpoint, model, hparams.ignore_layers, hparams.ignore_mismatched_layers)
         else:
             model, optimizer, lr_scheduler, mmi_criterion, iteration = load_checkpoint(
                 hparams.checkpoint, model, optimizer, lr_scheduler, criterion, hparams.restore_scheduler_state
@@ -269,7 +278,6 @@ def train(hparams, distributed_run=False, rank=0, n_gpus=None):
             epoch_offset = max(0, int(iteration / len(train_loader)))
 
     model.train()
-    is_overflow = False
     # ================ MAIN TRAINNIG LOOP! ===================
     for epoch in range(epoch_offset, hparams.epochs):
         print("Epoch: {}".format(epoch))
@@ -279,14 +287,15 @@ def train(hparams, distributed_run=False, rank=0, n_gpus=None):
             model.zero_grad()
             inputs, alignments, inputs_ctc = model.parse_batch(batch)
 
-            outputs, decoder_outputs = model(inputs)
+            with amp.autocast(enabled=hparams.fp16_run):
+                outputs, decoder_outputs = model(inputs)
 
-            losses = criterion(
-                outputs, inputs,
-                alignments=alignments,
-                inputs_ctc=inputs_ctc,
-                decoder_outputs=decoder_outputs
-            )
+                losses = criterion(
+                    outputs, inputs,
+                    alignments=alignments,
+                    inputs_ctc=inputs_ctc,
+                    decoder_outputs=decoder_outputs
+                )
 
             if hparams.use_mmi and hparams.use_gaf and i % gradient_adaptive_factor.UPDATE_GAF_EVERY_N_STEP == 0:
                 mi_loss = losses["mi/loss"]
@@ -300,28 +309,24 @@ def train(hparams, distributed_run=False, rank=0, n_gpus=None):
             reduced_losses = {key: reduce_loss(value, distributed_run, n_gpus) for key, value in losses.items()}
             loss = losses["overall/loss"]
 
-            if hparams.fp16_run:
-                with amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaled_loss.backward()
+            scaler.scale(loss).backward()
 
-                grad_norm = torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), hparams.grad_clip_thresh)
-                is_overflow = math.isnan(grad_norm)
-            else:
-                loss.backward()
+            scaler.unscale_(optimizer)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), hparams.grad_clip_thresh)
 
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), hparams.grad_clip_thresh)
+            scaler.step(optimizer)
+            scaler.update()
 
-            optimizer.step()
-
-            if not is_overflow and rank == 0:
+            if rank == 0:
                 learning_rate = lr_scheduler.get_last_lr()[0]
                 duration = time.perf_counter() - start
-                print("Iteration {}: overall loss {:.6f} Grad Norm {:.6f} {:.2f}s/it LR {:.3E}".format(
-                    iteration, reduced_losses["overall/loss"], grad_norm, duration, learning_rate))
+                print("Iteration {} ({} epoch): overall loss {:.6f} Grad Norm {:.6f} {:.2f}s/it LR {:.3E}".format(
+                    iteration, epoch, reduced_losses["overall/loss"], grad_norm, duration, learning_rate))
 
+                grad_norm = None if torch.isnan(grad_norm) or torch.isinf(grad_norm) else grad_norm
                 logger.log_training(reduced_losses, grad_norm, learning_rate, duration, iteration)
 
-            if not is_overflow and (iteration % hparams.iters_per_checkpoint == 0):
+            if iteration % hparams.iters_per_checkpoint == 0:
                 val_loss = validate(model, criterion, valset, iteration, hparams.batch_size, collate_fn, logger,
                                     distributed_run, rank, n_gpus)
                 if rank == 0:
@@ -335,9 +340,13 @@ def train(hparams, distributed_run=False, rank=0, n_gpus=None):
                 lr_scheduler.step()
 
         if not hparams.lr_scheduler == SchedulerTypes.cyclic:
-            # TODO: для plateau ошибка валидации должна рассчитываться в конце каждой эпохи, по-хорошему
-            scheduler_args = () if hparams.lr_scheduler != SchedulerTypes.plateau else (val_loss,)
-            lr_scheduler.step(*scheduler_args)
+            if hparams.lr_scheduler == SchedulerTypes.plateau:
+                lr_scheduler.step(
+                    validate(model, criterion, valset, iteration, hparams.batch_size, collate_fn,
+                             logger, distributed_run, rank, n_gpus)
+                )
+            else:
+                lr_scheduler.step()
 
 
 if __name__ == "__main__":

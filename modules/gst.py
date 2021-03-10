@@ -42,8 +42,8 @@ class ReferenceEncoder(torch.nn.Module):
 
 
     def forward(self, inputs, input_lengths=None):
-        N = inputs.size(0)
-        out = inputs.view(N, 1, -1, self.n_mels)  # [N, 1, Ty, n_mels]
+        assert inputs.size(-1) % self.n_mels == 0
+        out = inputs.view(inputs.size(0), 1, -1, self.n_mels)  # [N, 1, Ty, n_mels]
         for conv in self.convs:
             out = conv(out)
 
@@ -54,7 +54,7 @@ class ReferenceEncoder(torch.nn.Module):
         if input_lengths is not None:
             _input_lengths = self.calculate_size(input_lengths, **self.conv_params)
             out = nn.utils.rnn.pack_padded_sequence(
-                out, _input_lengths, batch_first=True, enforce_sorted=False
+                out, _input_lengths.cpu(), batch_first=True, enforce_sorted=False
             )
 
         self.gru.flatten_parameters()
@@ -81,14 +81,15 @@ class STL(torch.nn.Module):
         self.embed = torch.nn.Parameter(torch.FloatTensor(
             hparams.stl_token_num, hparams.encoder_embedding_dim // hparams.stl_num_heads
         ))
-        d_q = hparams.encoder_embedding_dim // 2
-        d_k = hparams.encoder_embedding_dim // hparams.stl_num_heads
+
+        self.query_dim = hparams.encoder_embedding_dim // 2
+        self.key_dim = hparams.encoder_embedding_dim // hparams.stl_num_heads
 
         self.attention = MultiHeadAttention(
-            query_dim=d_q,
-            key_dim=d_k,
-            num_units=hparams.encoder_embedding_dim,
-            num_heads=hparams.stl_num_heads
+            query_dim=self.query_dim,
+            key_dim=self.key_dim,
+            dim=hparams.encoder_embedding_dim,
+            heads=hparams.stl_num_heads
         )
 
         torch.nn.init.normal_(self.embed, mean=0, std=0.5)
@@ -100,7 +101,7 @@ class STL(torch.nn.Module):
         keys = torch.tanh(self.embed).unsqueeze(0).expand(N, -1, -1)  # [N, token_num, E // num_heads]
 
         weights, style_emb = self.attention(query, keys)
-        weights = weights.squeeze(2).transpose(1, 0)  # [N, num_heads, token_num]
+        weights = weights.squeeze(2)  # [N, num_heads, token_num]
 
         return weights, style_emb
 
@@ -114,38 +115,35 @@ class MultiHeadAttention(torch.nn.Module):
         out --- [N, T_q, num_units]
     '''
 
-    def __init__(self, query_dim, key_dim, num_units, num_heads):
+    def __init__(self, query_dim, key_dim, dim, heads):
         super().__init__()
-        self.num_units = num_units
-        self.num_heads = num_heads
+        self.query_dim = query_dim
         self.key_dim = key_dim
+        self.dim = dim
+        self.heads = heads
 
-        self.W_query = LinearNorm(query_dim, num_units, bias=False)
-        self.W_key = LinearNorm(key_dim, num_units, bias=False)
-        self.W_value = LinearNorm(key_dim, num_units, bias=False)
+        self.W_query = LinearNorm(query_dim, dim, bias=False)
+        self.W_key = LinearNorm(key_dim, dim, bias=False)
+        self.W_value = LinearNorm(key_dim, dim, bias=False)
 
 
     def forward(self, query, key):
-        querys = self.W_query(query)  # [N, T_q, num_units]
-        keys = self.W_key(key)  # [N, T_k, num_units]
-        values = self.W_value(key)
+        q = self.W_query(query)  # [b, t_q, dim]
+        k = self.W_key(key)  # [b, t_k, dim]
+        v = self.W_value(key)
 
-        split_size = self.num_units // self.num_heads
-        # [h, N, T_q, num_units/h]
-        querys = torch.stack(torch.split(querys, split_size, dim=2), dim=0)
-        # [h, N, T_k, num_units/h]
-        keys = torch.stack(torch.split(keys, split_size, dim=2), dim=0)
-        # [h, N, T_k, num_units/h]
-        values = torch.stack(torch.split(values, split_size, dim=2), dim=0)
+        b, head_dim = query.size(0), self.dim // self.heads
+        split_heads = lambda x: x.view(b, -1, self.heads, head_dim).transpose(2, 1)
+        q, k, v = map(split_heads, (q, k, v))  # [b, h, t_q/k, head_dim]
 
         # score = softmax(QK^T / (d_k ** 0.5))
-        scores = torch.matmul(querys, keys.transpose(2, 3))  # [h, N, T_q, T_k]
+        scores = torch.matmul(q, k.transpose(2, 3))  # [b, h, t_q, t_k]
         scores = scores / (self.key_dim ** 0.5)
-        scores = torch.nn.functional.softmax(scores, dim=3)
+        scores = scores.softmax(dim=-1)
 
         # out = score * V
-        out = torch.matmul(scores, values)  # [h, N, T_q, num_units/h]
-        out = torch.cat(torch.split(out, 1, dim=0), dim=3).squeeze(0)  # [N, T_q, num_units]
+        out = torch.matmul(scores, v)  # [b, h, t_q, head_dim]
+        out = out.transpose(2, 1).contiguous().view(b, -1, self.dim)  # [b, t_q, dim]
 
         return scores, out
 
@@ -171,15 +169,12 @@ class GST(torch.nn.Module):
 
 
     def inference(self, encoder_outputs, reference_mel=None, token_idx=None):
-        dtype = torch.half if not self.device.type == "cpu" else torch.float
-
         style_embedding = None
         if reference_mel is not None:
             _, style_embedding = self._forward(reference_mel)
             style_embedding = style_embedding.expand_as(encoder_outputs)
         elif token_idx is not None:
-            encoder_embedding_dim = encoder_outputs.size(-1)
-            query = torch.zeros(1, 1, encoder_embedding_dim // 2).to(device=self.device, dtype=dtype)
+            query = self.stl.embed.new_zeros(1, 1, self.stl.query_dim)
             token = torch.tanh(self.stl.embed[token_idx]).view(1, 1, -1)
             _, style_embedding = self.stl.attention(query, token)
 
