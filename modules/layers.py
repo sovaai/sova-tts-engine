@@ -93,7 +93,7 @@ class ConvBlock(torch.nn.Module):
                 stride=stride,
                 padding=int(dilation * (kernel_size - 1) / 2) if padding is None else padding,
                 dilation=dilation,
-                bias=bias and not bn,
+                bias=bias,
                 initscheme=initscheme,
                 nonlinearity=nonlinearity
             )
