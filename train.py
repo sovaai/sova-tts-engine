@@ -398,7 +398,6 @@ if __name__ == "__main__":
     hparams.weight_decay = float(hparams.weight_decay)
 
     print("FP16 Run:", hparams.fp16_run)
-    print("Dynamic Loss Scaling:", hparams.dynamic_loss_scaling)
     print("Distributed Run:", args.distributed_run)
     print("cuDNN Enabled:", hparams.cudnn_enabled)
     print("cuDNN Benchmark:", hparams.cudnn_benchmark)
