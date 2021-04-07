@@ -35,7 +35,7 @@ alignments_path:
 training_files:
 validation_files:
 
-charset: "ru" # possible entries: en, ru, ru_trans
+charset: "ru" # possible entries: ru, ru_trans
 text_handler_cfg: # data/text_handler_cfg.yaml
 
 # mask_stress: Union[float, bool]. If float, the number must be in {0, 1} - the probability of masking stressed
@@ -63,8 +63,8 @@ mel_fmin: 0.0
 mel_fmax: 8000.0
 
 add_silence: True
-trim_silence: True
-trim_top_db: 45 # empirically
+trim_silence: False
+trim_top_db: 45
 
 ################################
 # Model Parameters             #
@@ -119,7 +119,7 @@ stl_num_heads: 8
 # loss functions parameters
 guided_attention_type: "diagonal" # possible entries: 'none', 'diagonal', 'prealigned'
 attention_weight: 1.0
-diagonal_factor: 0.15 #
+diagonal_factor: 0.2 #
 include_padding: False # how to calculate loss for attention: considering padding values or not
 
 # mel_loss_type: type of the loss function used to penalize wrong mel predictions
@@ -137,19 +137,16 @@ optim_options:
 # examples: Ranger = RAdam + LookAhead
 with_lookahead: False
 
-lr_scheduler: "multi_step" # possible entries: 'none', 'multi_step', 'exp', 'plateau', 'cyclic'
+lr_scheduler: "plateau" # possible entries: 'none', 'multi_step', 'exp', 'plateau', 'cyclic'
 lr_scheduler_options:
-#  max_lr: !!float 1e-3
-#  base_lr: !!float 1e-5
-#  mode: "exp_range"
-#  gamma: 0.9
-#  cycle_momentum: false
-  gamma: 0.1
-  milestones: [100, 110]
+  factor: 0.1
+  patience: 5
+  threshold: 0.03
+  min_lr: !!float 1e-6
 restore_scheduler_state: False
 
 grad_clip_thresh: 1.0
-batch_size: 4
+batch_size: 16
 mask_padding: True  # set model's padded outputs to padded values
 
 # other parameters
