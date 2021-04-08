@@ -79,11 +79,13 @@ class SchedulerTypes(str, Enum):
 
 
 class ReduceLROnPlateau(optim.lr_scheduler.ReduceLROnPlateau):
-    def __init__(self, optimizer, mode='min', factor=0.1, patience=10,
-                 verbose=False, threshold=1e-4, threshold_mode='rel',
-                 cooldown=0, min_lr=0, eps=1e-8):
-        super(ReduceLROnPlateau, self).__init__(optimizer, mode, factor, patience,
-                 verbose, threshold, threshold_mode, cooldown, min_lr, eps)
+    def __init__(self, optimizer, mode='min', factor=0.1, patience=10, threshold=1e-4, threshold_mode='rel',
+                 cooldown=0, min_lr=0, eps=1e-8, verbose=False):
+        super(ReduceLROnPlateau, self).__init__(
+            optimizer=optimizer, mode=mode, factor=factor, patience=patience,
+            threshold=threshold, threshold_mode=threshold_mode,
+            cooldown=cooldown, min_lr=min_lr, eps=eps, verbose=verbose
+        )
 
         self._last_lr = [group['lr'] for group in self.optimizer.param_groups]
 
