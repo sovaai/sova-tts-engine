@@ -87,10 +87,8 @@ def init_distributed(hparams, n_gpus, rank, group_name):
 
 def prepare_dataloaders(hparams, distributed_run=False):
     # Get data, data loaders and collate function ready
-    if isinstance(hparams.text_handler_cfg, str):
-        text_handler = Handler.from_config(hparams.text_handler_cfg)
-        text_handler.out_max_length = None
-        assert text_handler.charset.value == hparams.charset
+    if hparams.use_basic_handler:
+        text_handler = Handler(hparams.charset)
     else:
         text_handler = Handler.from_charset(hparams.charset, data_dir="data", silent=True)
 
@@ -327,7 +325,7 @@ def train(hparams, distributed_run=False, rank=0, n_gpus=None):
                 logger.log_training(reduced_losses, grad_norm, learning_rate, duration, iteration)
 
             if iteration % hparams.iters_per_checkpoint == 0:
-                val_loss = validate(model, criterion, valset, iteration, hparams.batch_size, collate_fn, logger,
+                validate(model, criterion, valset, iteration, hparams.batch_size, collate_fn, logger,
                                     distributed_run, rank, n_gpus)
                 if rank == 0:
                     checkpoint = os.path.join(

@@ -47,8 +47,7 @@ from modules.loss_function import AttentionTypes
 
 ctc_mapping = {
     symbols.Charset.en: symbols.en.EN_SET,
-    symbols.Charset.ru: symbols.ru.RU_SET,
-    symbols.Charset.ru_trans: symbols.ru.RU_TRANS_SET
+    symbols.Charset.ru: symbols.ru.RU_SET
 }
 
 

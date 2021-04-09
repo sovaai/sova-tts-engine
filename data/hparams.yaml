@@ -35,8 +35,8 @@ alignments_path:
 training_files:
 validation_files:
 
-charset: "ru" # possible entries: ru, ru_trans
-text_handler_cfg: # data/text_handler_cfg.yaml
+charset: "ru" # possible entries: ru, en
+use_basic_handler: true
 
 # mask_stress: Union[float, bool]. If float, the number must be in {0, 1} - the probability of masking stressed
 # words into learning process (passing them unstressed)
@@ -140,7 +140,7 @@ with_lookahead: False
 lr_scheduler: "plateau" # possible entries: 'none', 'multi_step', 'exp', 'plateau', 'cyclic'
 lr_scheduler_options:
   factor: 0.1
-  patience: 5
+  patience: 10
   threshold: 0.03
   min_lr: !!float 1e-6
 restore_scheduler_state: False
