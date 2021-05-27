@@ -17,7 +17,7 @@ First of all you need to install all dependencies (which can be found in the reu
 
 Then divide it into two files: the training list (90% of the data) and the validation list (10% of the data).
 
-After that configure the config file as needed ([here]() you can find an explanation of the main fields of the config file), or just use the default one, filling in the values of parameters `output_dir` (where to save checkpoints), `training_files` (path to the training list), `validation_files` (path to the validation list) and `audios_path` (path to the audio folder, so that together with the relative path to the audio, the full path is obtained).
+After that configure the config file as needed ([here](https://github.com/sovaai/sova-tts-engine/blob/master/data/README.md) you can find an explanation of the main fields of the config file), or just use the default one, filling in the values of parameters `output_dir` (where to save checkpoints), `training_files` (path to the training list), `validation_files` (path to the validation list) and `audios_path` (path to the audio folder, so that together with the relative path to the audio, the full path is obtained).
 
 When everything is ready, launch the training process: 
 * in case if you changed hparams.yaml inside the 'data' folder: `python train.py`
